@@ -1,293 +1,626 @@
-#- pip install "granite-tsfm[notebooks] @ git+https://github.com/ibm-granite/granite-tsfm.git@v0.2.22"
-#
+"""
+Time Series Forecasting com TinyTimeMixer (TTM) - IBM Granite
+
+Este módulo implementa um modelo de previsão de séries temporais utilizando o TinyTimeMixer
+da IBM Granite, aplicado para previsão de vendas e faturamento por produto e UF.
+
+Instalação das dependências:
+pip install "granite-tsfm[notebooks] @ git+https://github.com/ibm-granite/granite-tsfm.git@v0.2.22"
+pip install transformers torch accelerate bitsandbytes pandas scikit-learn gdown peft
+
+Autor: [Seu Nome]
+Data: [Data Atual]
+Versão: 1.0
+"""
 
 import pandas as pd
 import torch
 import numpy as np
-import math # Para math.ceil no scheduler
-import os # Para os.cpu_count
+import math
+import os
 
-# Importações específicas da biblioteca Hugging Face e TSFM
+# Importações específicas da biblioteca Hugging Face e TSFM para treinamento
 from transformers import (
-    BitsAndBytesConfig,
-    TrainingArguments,
-    Trainer,
-    EarlyStoppingCallback,
+    BitsAndBytesConfig,      # Configuração para quantização de bits
+    TrainingArguments,       # Argumentos de treinamento do modelo
+    Trainer,                 # Classe principal para treinamento
+    EarlyStoppingCallback,   # Callback para parada antecipada
 )
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import OneCycleLR
-from peft import LoraConfig, get_peft_model # Importante para aplicar LoRA ao modelo
+from torch.optim import AdamW                    # Otimizador AdamW
+from torch.optim.lr_scheduler import OneCycleLR  # Scheduler de learning rate
+from peft import LoraConfig, get_peft_model      # Para fine-tuning eficiente
 
-# Componentes da biblioteca IBM Granite TSFM
+# Componentes da biblioteca IBM Granite TSFM para processamento de séries temporais
 from tsfm_public import (
-    TimeSeriesPreprocessor,
-    TinyTimeMixerForPrediction,
-    ForecastDFDataset,
-    TrackingCallback,
+    TimeSeriesPreprocessor,      # Preprocessador de séries temporais
+    TinyTimeMixerForPrediction,  # Modelo TTM para previsão
+    ForecastDFDataset,           # Dataset personalizado para previsão
+    TrackingCallback,            # Callback para tracking de métricas
 )
 from tsfm_public.toolkit.time_series_preprocessor import prepare_data_splits
 from tsfm_public.models.tinytimemixer.configuration_tinytimemixer import TinyTimeMixerConfig
 
-# --- 1. Dados e Configurações Iniciais ---
-# Carregamento do seu arquivo de dados. O dtype da coluna 'date' já é datetime64[ns], o que é ideal.
-try:
-    df = pd.read_csv("./dados/db_tratado-w.csv", parse_dates=["date"])
-except FileNotFoundError:
-    print("Erro: Arquivo db_tratado-w.csv não encontrado. Por favor, verifique o caminho.")
-    # Exemplo de DataFrame para demonstração se o arquivo não estiver presente:
-    print("Criando um DataFrame de exemplo para prosseguir com a demonstração...")
-    data_example = {
-        'date': pd.to_datetime(['2023-01-01', '2023-01-08', '2023-01-15', '2023-01-22', '2023-01-29', '2023-02-05',
-                                '2023-02-12', '2023-02-19', '2023-02-26', '2023-03-05', '2023-03-12', '2023-03-19']),
-        'produto_cat': [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-        'uf_cat': [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
-        'vendas': [3-14],
-        'faturamento': [1000.0, 1100.0, 1050.0, 1200.0, 1150.0, 1300.0, 1250.0, 1400.0, 1350.0, 1500.0, 1450.0, 1600.0]
-    }
-    df_single_product = pd.DataFrame(data_example)
-    # Simular múltiplos produtos e UFs para atingir ~6440 entradas
-    df = pd.concat([df_single_product.copy().assign(produto_cat=i, uf_cat=j)
-                    for i in range(1, 20) for j in range(1, 5)], ignore_index=True)
-    df['date'] = pd.to_datetime(df['date']) # Ensure datetime type after concat
-    print("DataFrame de exemplo criado.")
+# =============================================================================
+# SEÇÃO 1: CARREGAMENTO E CONFIGURAÇÃO INICIAL DOS DADOS
+# =============================================================================
 
+def load_data():
+    """
+    Carrega os dados de vendas e faturamento do arquivo CSV.
+    
+    Se o arquivo não for encontrado, cria um DataFrame de exemplo para demonstração
+    com dados sintéticos de vendas e faturamento por produto e UF.
+    
+    Returns:
+        pd.DataFrame: DataFrame com colunas date, produto_cat, uf_cat, vendas, faturamento
+    """
+    try:
+        # Tenta carregar o arquivo de dados real
+        df = pd.read_csv("./dados/db_tratado-w.csv", parse_dates=["date"])
+        print("Dados carregados do arquivo db_tratado-w.csv")
+        return df
+    except FileNotFoundError:
+        print("Erro: Arquivo db_tratado-w.csv não encontrado. Criando DataFrame de exemplo...")
+        
+        # Criar dados de exemplo para demonstração
+        data_example = {
+            'date': pd.to_datetime(['2023-01-01', '2023-01-08', '2023-01-15', '2023-01-22', '2023-01-29', '2023-02-05',
+                                    '2023-02-12', '2023-02-19', '2023-02-26', '2023-03-05', '2023-03-12', '2023-03-19']),
+            'produto_cat': [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # Categoria do produto (codificada)
+            'uf_cat': [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],        # UF categorizada (codificada)
+            'vendas': [300, 310, 305, 320, 315, 330, 325, 340, 335, 350, 345, 360],      # Volume de vendas
+            'faturamento': [1000.0, 1100.0, 1050.0, 1200.0, 1150.0, 1300.0, 1250.0,     # Valor do faturamento
+                           1400.0, 1350.0, 1500.0, 1450.0, 1600.0]
+        }
+        df_single_product = pd.DataFrame(data_example)
+        
+        # Simular múltiplos produtos (1-19) e UFs (1-4) para ter um dataset mais robusto
+        df = pd.concat([df_single_product.copy().assign(produto_cat=i, uf_cat=j)
+                        for i in range(1, 20) for j in range(1, 5)], ignore_index=True)
+        df['date'] = pd.to_datetime(df['date'])
+        print("DataFrame de exemplo criado com 19 produtos x 4 UFs = 76 combinações")
+        return df
 
-print("\nDataFrame carregado/criado com sucesso:")
+# Carregar dados
+df = load_data()
+
+print("\nInformações do DataFrame carregado:")
 print(df.info())
+print("\nPrimeiras linhas do DataFrame:")
 print(df.head())
 
-# Definindo as configurações do seu dataset para o pré-processador
-TIMESTAMP_COLUMN = 'date'
-ID_COLUMNS = ['produto_cat'] # Coluna que identifica unicamente cada série temporal de produto
-TARGET_COLUMNS = ['vendas', 'faturamento'] # Colunas que serão previstas
-STATIC_CATEGORICAL_COLUMNS = ['uf_cat'] # Coluna categórica que não varia no tempo para uma série
-CONTROL_COLUMNS = [] # Não há colunas exógenas 'controláveis' ou 'observáveis' além das estáticas
+# =============================================================================
+# CONFIGURAÇÕES PRINCIPAIS DO MODELO E DATASET
+# =============================================================================
 
-# Granularidade temporal semanal.
-# Vamos definir o context_length para 2 anos de dados semanais (aproximadamente 104 semanas)
-# e prediction_length para 12 semanas (aproximadamente 3 meses).
-CONTEXT_LENGTH = 104 # 2 anos de histórico semanal
-PREDICTION_LENGTH = 12 # 3 meses de previsão semanal
+# Configurações das colunas do dataset
+TIMESTAMP_COLUMN = 'date'                          # Coluna de timestamp (data)
+ID_COLUMNS = ['produto_cat', 'uf_cat']             # Colunas identificadoras das séries
+TARGET_COLUMNS = ['vendas', 'faturamento']         # Variáveis alvo para previsão
+STATIC_CATEGORICAL_COLUMNS = ['uf_cat']            # Variáveis categóricas estáticas
+CONTROL_COLUMNS = []                               # Variáveis de controle (vazio neste caso)
 
-# Configuração do dispositivo de hardware
+# Configurações temporais do modelo
+CONTEXT_LENGTH = 104    # Janela de contexto: 2 anos de histórico semanal (52*2=104)
+PREDICTION_LENGTH = 26  # Horizonte de previsão: 6 meses semanais (~26 semanas)
+
+# Configuração automática do dispositivo de processamento
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Usando dispositivo: {DEVICE}")
+print(f"\nDispositivo de processamento: {DEVICE}")
+if DEVICE == "cuda":
+    print(f"GPU disponível: {torch.cuda.get_device_name(0)}")
+    print(f"Memória GPU: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
-# --- 2. Pré-processamento e Divisão dos Dados com TimeSeriesPreprocessor ---
+# =============================================================================
+# SEÇÃO 2: PRÉ-PROCESSAMENTO E PREPARAÇÃO DOS DADOS
+# =============================================================================
 
-# Instanciando o TimeSeriesPreprocessor
-# Conforme a Seção 2.3 da refatoração, o escalonamento deve ser independente por canal.
-# 'scaling_id_columns=ID_COLUMNS + STATIC_CATEGORICAL_COLUMNS' garante que o escalonamento
-# (normalização) seja feito para cada combinação única de produto_cat e uf_cat, que define
-# o que entendemos por "canal" para previsão.
-tsp = TimeSeriesPreprocessor(
-    id_columns=ID_COLUMNS,
-    timestamp_column=TIMESTAMP_COLUMN,
-    target_columns=TARGET_COLUMNS,
-    static_categorical_columns=STATIC_CATEGORICAL_COLUMNS,
-    control_columns=CONTROL_COLUMNS, # Lista vazia, conforme definido acima
-    context_length=CONTEXT_LENGTH,
-    prediction_length=PREDICTION_LENGTH,
-    scaling=True, # Habilita a normalização dos dados
-    scaler_type="standard", # Usa StandardScaler (média 0, desvio padrão 1)
-    scaling_id_columns=ID_COLUMNS + STATIC_CATEGORICAL_COLUMNS, # Escalonamento por canal produto-UF [15]
-    encode_categorical=True, # Codifica 'uf_cat' para que o modelo possa processá-la [16, 17]
+def resample_data_to_weekly(df, timestamp_col, id_cols):
+    """
+    Resampling dos dados para frequência semanal consistente.
+    
+    Agrupa por combinações produto-UF e aplica resampling semanal,
+    preenchendo valores faltantes com forward fill.
+    
+    Args:
+        df (pd.DataFrame): DataFrame original
+        timestamp_col (str): Nome da coluna de timestamp
+        id_cols (list): Lista das colunas identificadoras
+    
+    Returns:
+        pd.DataFrame: DataFrame com frequência semanal consistente
+    """
+    print("Aplicando resampling para frequência semanal...")
+    
+    # Ordenar dados por timestamp e IDs para consistência
+    df = df.sort_values([timestamp_col] + id_cols).reset_index(drop=True)
+    
+    df_resampled = []
+    total_groups = df.groupby(id_cols).ngroups
+    processed_groups = 0
+    
+    # Processar cada combinação produto-UF separadamente
+    for group_keys, group_df in df.groupby(id_cols):
+        # Definir timestamp como índice para resampling
+        group_df = group_df.set_index(timestamp_col)
+        
+        # Aplicar resampling semanal (W) pegando último valor de cada semana
+        group_df = group_df.resample('W').last().ffill()
+        
+        # Resetar índice para voltar timestamp como coluna
+        group_df = group_df.reset_index()
+        
+        # Restaurar colunas identificadoras (produto_cat, uf_cat)
+        for i, col in enumerate(id_cols):
+            group_df[col] = group_keys[i] if isinstance(group_keys, tuple) else group_keys
+        
+        df_resampled.append(group_df)
+        processed_groups += 1
+        
+        # Log de progresso a cada 10 grupos processados
+        if processed_groups % 10 == 0:
+            print(f"Processados {processed_groups}/{total_groups} grupos produto-UF")
+    
+    return pd.concat(df_resampled, ignore_index=True)
+
+# Aplicar resampling nos dados
+df = resample_data_to_weekly(df, TIMESTAMP_COLUMN, ID_COLUMNS)
+print(f"Resampling concluído. Dataset final: {len(df)} registros")
+
+def create_time_series_preprocessor():
+    """
+    Cria e configura o preprocessador de séries temporais TTM.
+    
+    Returns:
+        TimeSeriesPreprocessor: Preprocessador configurado para o dataset
+    """
+    print("Configurando preprocessador de séries temporais...")
+    
+    return TimeSeriesPreprocessor(
+        id_columns=ID_COLUMNS,                      # Colunas identificadoras das séries
+        timestamp_column=TIMESTAMP_COLUMN,          # Coluna de timestamp
+        target_columns=TARGET_COLUMNS,              # Variáveis alvo para previsão
+        static_categorical_columns=STATIC_CATEGORICAL_COLUMNS,  # Variáveis categóricas
+        scaling_id_columns=ID_COLUMNS,              # Colunas para escalonamento por grupo
+        context_length=CONTEXT_LENGTH,              # Tamanho da janela de contexto
+        prediction_length=PREDICTION_LENGTH,        # Horizonte de previsão
+        scaling=True,                              # Aplicar normalização/escalonamento
+        scaler_type="standard",                    # Tipo de escalonamento (StandardScaler)
+        encode_categorical=True,                   # Codificar variáveis categóricas
+        control_columns=CONTROL_COLUMNS,           # Variáveis de controle externas
+        observable_columns=[],                     # Variáveis observáveis durante previsão
+        freq='W'                                   # Frequência dos dados (semanal)
+    )
+
+# Criar e treinar preprocessador
+tsp = create_time_series_preprocessor()
+print("Treinando preprocessador com todos os dados...")
+trained_tsp = tsp.train(df)
+
+# Aplicar preprocessamento aos dados
+print("Aplicando transformações de preprocessamento...")
+df_processed = trained_tsp.preprocess(df)
+print(f"Preprocessamento concluído. Shape dos dados processados: {df_processed.shape}")
+
+# =============================================================================
+# SEÇÃO 3: DIVISÃO DOS DADOS E CRIAÇÃO DOS DATASETS
+# =============================================================================
+
+def split_data_by_combinations(df_processed, id_columns, train_frac=0.7, val_frac=0.15, random_state=42):
+    """
+    Divide os dados preservando combinações produto-UF inteiras.
+    
+    Evita vazamento de dados garantindo que uma combinação produto-UF
+    não apareça em múltiplos conjuntos (treino/validação/teste).
+    
+    Args:
+        df_processed (pd.DataFrame): Dados preprocessados
+        id_columns (list): Colunas identificadoras para preservar
+        train_frac (float): Fração para treinamento (padrão: 0.7)
+        val_frac (float): Fração para validação (padrão: 0.15)
+        random_state (int): Seed para reprodutibilidade
+    
+    Returns:
+        tuple: (train_data, valid_data, test_data)
+    """
+    print("Dividindo dados preservando combinações produto-UF...")
+    
+    # Obter combinações únicas de produto-UF
+    unique_combinations = df_processed[id_columns].drop_duplicates()
+    total_combinations = len(unique_combinations)
+    
+    # Divisão estratificada das combinações
+    train_combinations = unique_combinations.sample(frac=train_frac, random_state=random_state)
+    remaining = unique_combinations.drop(train_combinations.index)
+    
+    # Da parte restante, dividir entre validação e teste
+    val_frac_remaining = val_frac / (1 - train_frac)  # Ajustar fração para o restante
+    valid_combinations = remaining.sample(frac=val_frac_remaining, random_state=random_state)
+    test_combinations = remaining.drop(valid_combinations.index)
+    
+    # Filtrar dados processados baseado nas combinações
+    train_data = df_processed.merge(train_combinations, on=id_columns)
+    valid_data = df_processed.merge(valid_combinations, on=id_columns)
+    test_data = df_processed.merge(test_combinations, on=id_columns)
+    
+    print(f"Divisão concluída:")
+    print(f"  Treino: {len(train_combinations):>3} combinações ({len(train_data):>4} registros)")
+    print(f"  Validação: {len(valid_combinations):>3} combinações ({len(valid_data):>4} registros)")
+    print(f"  Teste: {len(test_combinations):>3} combinações ({len(test_data):>4} registros)")
+    print(f"  Total: {total_combinations} combinações únicas")
+    
+    return train_data, valid_data, test_data
+
+# Aplicar divisão dos dados
+train_data, valid_data, test_data = split_data_by_combinations(df_processed, ID_COLUMNS)
+
+def create_forecast_datasets(train_data, valid_data, test_data, trained_tsp):
+    """
+    Cria os datasets específicos para o modelo TTM de previsão.
+    
+    Args:
+        train_data, valid_data, test_data (pd.DataFrame): Dados divididos
+        trained_tsp (TimeSeriesPreprocessor): Preprocessador treinado
+    
+    Returns:
+        tuple: (train_dataset, valid_dataset, test_dataset)
+    """
+    print("Criando datasets TTM para treinamento...")
+    
+    # Obter frequency token do preprocessador
+    freq_token = trained_tsp.get_frequency_token(trained_tsp.freq)
+    print(f"Frequency token: {freq_token}")
+    
+    # Configuração comum para todos os datasets
+    dataset_config = {
+        'id_columns': ID_COLUMNS,
+        'timestamp_column': TIMESTAMP_COLUMN,
+        'target_columns': TARGET_COLUMNS,
+        'control_columns': CONTROL_COLUMNS,
+        'static_categorical_columns': STATIC_CATEGORICAL_COLUMNS,
+        'context_length': CONTEXT_LENGTH,
+        'prediction_length': PREDICTION_LENGTH,
+        'frequency_token': freq_token
+    }
+    
+    # Criar datasets para cada divisão
+    train_dataset = ForecastDFDataset(train_data, **dataset_config)
+    valid_dataset = ForecastDFDataset(valid_data, **dataset_config)
+    test_dataset = ForecastDFDataset(test_data, **dataset_config)
+    
+    print(f"Datasets TTM criados:")
+    print(f"  Treino: {len(train_dataset):>4} amostras")
+    print(f"  Validação: {len(valid_dataset):>4} amostras")
+    print(f"  Teste: {len(test_dataset):>4} amostras")
+    
+    return train_dataset, valid_dataset, test_dataset
+
+# Criar datasets TTM
+train_dataset, valid_dataset, test_dataset = create_forecast_datasets(
+    train_data, valid_data, test_data, trained_tsp
 )
 
-# Divisão estratégica dos dados (70% treino, 15% validação, 15% teste) em ordem cronológica
-# A função 'prepare_data_splits' da TSFM facilita essa divisão.
-train_data_raw, valid_data_raw, test_data_raw = prepare_data_splits(
-    df,
-    id_columns=ID_COLUMNS + STATIC_CATEGORICAL_COLUMNS, # IDs para garantir a divisão por canal
-    context_length=CONTEXT_LENGTH, # Necessário para que a divisão considere janelas de contexto
-    split_config={"train": 0.7, "test": 0.15} # 'valid' = 0.15 é calculado implicitamente
-)
+# =============================================================================
+# SEÇÃO 4: CONFIGURAÇÃO E INICIALIZAÇÃO DO MODELO TTM
+# =============================================================================
 
-# Treinar o preprocessor APENAS com os dados de treino para evitar data leakage (vazamento de dados) [10]
-trained_tsp = tsp.train(train_data_raw)
+def create_ttm_config(trained_tsp):
+    """
+    Cria configuração personalizada para o modelo TinyTimeMixer.
+    
+    Adapta o modelo pré-treinado para o dataset específico,
+    configurando canais de entrada, saída e variáveis categóricas.
+    
+    Args:
+        trained_tsp (TimeSeriesPreprocessor): Preprocessador treinado
+    
+    Returns:
+        TinyTimeMixerConfig: Configuração do modelo TTM
+    """
+    print("Configurando modelo TinyTimeMixer...")
+    
+    config = TinyTimeMixerConfig(
+        context_length=CONTEXT_LENGTH,                      # Janela de contexto histórico
+        prediction_length=PREDICTION_LENGTH,                # Horizonte de previsão
+        num_input_channels=trained_tsp.num_input_channels,  # Número de canais de entrada
+        prediction_channel_indices=trained_tsp.prediction_channel_indices,  # Índices dos canais alvo
+        exogenous_channel_indices=trained_tsp.exogenous_channel_indices,    # Índices de variáveis exógenas
+        decoder_mode="mix_channel",                         # Modo de decodificação (mix de canais)
+        categorical_vocab_size_list=trained_tsp.categorical_vocab_size_list,  # Tamanhos dos vocabulários categóricos
+    )
+    
+    print(f"Configuração TTM:")
+    print(f"  Context Length: {config.context_length}")
+    print(f"  Prediction Length: {config.prediction_length}")
+    print(f"  Input Channels: {config.num_input_channels}")
+    print(f"  Prediction Channels: {len(config.prediction_channel_indices)}")
+    print(f"  Categorical Vocabularies: {config.categorical_vocab_size_list}")
+    
+    return config
 
-# Preparar os datasets para o PyTorch/Hugging Face Trainer
-# 'ForecastDFDataset' é um wrapper que formata os dados pré-processados para o modelo.
-# O 'frequency_token' é adicionado para informar o modelo sobre a granularidade dos dados.
-train_dataset = ForecastDFDataset(trained_tsp.preprocess(train_data_raw),
-                                  id_columns=ID_COLUMNS,
-                                  timestamp_column=TIMESTAMP_COLUMN,
-                                  target_columns=TARGET_COLUMNS,
-                                  control_columns=CONTROL_COLUMNS,
-                                  static_categorical_columns=STATIC_CATEGORICAL_COLUMNS,
-                                  context_length=CONTEXT_LENGTH,
-                                  prediction_length=PREDICTION_LENGTH,
-                                  frequency_token=trained_tsp.get_frequency_token(trained_tsp.freq)
-                                  )
+def load_pretrained_ttm_model(config):
+    """
+    Carrega modelo TTM pré-treinado da IBM Granite.
+    
+    Utiliza o modelo granite-timeseries-ttm-r2 como base e adapta
+    para a configuração específica do dataset.
+    
+    Args:
+        config (TinyTimeMixerConfig): Configuração do modelo
+    
+    Returns:
+        TinyTimeMixerForPrediction: Modelo TTM carregado
+    """
+    print("Carregando modelo TTM pré-treinado...")
+    
+    model = TinyTimeMixerForPrediction.from_pretrained(
+        "ibm-granite/granite-timeseries-ttm-r2",    # Modelo base pré-treinado
+        config=config,                              # Configuração personalizada
+        device_map="auto",                          # Mapeamento automático de dispositivos
+        ignore_mismatched_sizes=True,              # Ignorar incompatibilidades de tamanho
+    )
+    
+    print(f"Modelo carregado: {model.__class__.__name__}")
+    return model
 
-valid_dataset = ForecastDFDataset(trained_tsp.preprocess(valid_data_raw),
-                                  id_columns=ID_COLUMNS,
-                                  timestamp_column=TIMESTAMP_COLUMN,
-                                  target_columns=TARGET_COLUMNS,
-                                  control_columns=CONTROL_COLUMNS,
-                                  static_categorical_columns=STATIC_CATEGORICAL_COLUMNS,
-                                  context_length=CONTEXT_LENGTH,
-                                  prediction_length=PREDICTION_LENGTH,
-                                  frequency_token=trained_tsp.get_frequency_token(trained_tsp.freq)
-                                  )
+def setup_selective_fine_tuning(model):
+    """
+    Configura fine-tuning seletivo congelando a maioria das camadas.
+    
+    Mantém apenas as camadas fully-connected (fc1/fc2) treináveis,
+    reduzindo significativamente o número de parâmetros a treinar.
+    
+    Args:
+        model: Modelo TTM carregado
+    
+    Returns:
+        None (modifica modelo in-place)
+    """
+    print("Configurando fine-tuning seletivo...")
+    
+    # Congelar todas as camadas inicialmente
+    for param in model.parameters():
+        param.requires_grad = False
+    
+    # Descongelar apenas camadas fc1 e fc2 (fully-connected)
+    trainable_layers = []
+    for name, module in model.named_modules():
+        if 'fc1' in name or 'fc2' in name:
+            if isinstance(module, torch.nn.Linear):
+                module.requires_grad_(True)
+                trainable_layers.append(name)
+    
+    # Calcular estatísticas de parâmetros
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_percentage = (trainable_params / total_params) * 100
+    
+    print(f"Fine-tuning seletivo configurado:")
+    print(f"  Camadas treináveis: {trainable_layers}")
+    print(f"  Parâmetros treináveis: {trainable_params:,} / {total_params:,} ({trainable_percentage:.1f}%)")
+    print(f"  Redução de parâmetros: {100-trainable_percentage:.1f}%")
 
-test_dataset = ForecastDFDataset(trained_tsp.preprocess(test_data_raw),
-                                 id_columns=ID_COLUMNS,
-                                 timestamp_column=TIMESTAMP_COLUMN,
-                                 target_columns=TARGET_COLUMNS,
-                                 control_columns=CONTROL_COLUMNS,
-                                 static_categorical_columns=STATIC_CATEGORICAL_COLUMNS,
-                                 context_length=CONTEXT_LENGTH,
-                                 prediction_length=PREDICTION_LENGTH,
-                                 frequency_token=trained_tsp.get_frequency_token(trained_tsp.freq)
-                                 )
+# Executar configuração do modelo
+model_config = create_ttm_config(trained_tsp)
+model = load_pretrained_ttm_model(model_config)
+setup_selective_fine_tuning(model)
 
-print(f"\nTamanho do dataset de treino: {len(train_dataset)}")
-print(f"Tamanho do dataset de validação: {len(valid_dataset)}")
-print(f"Tamanho do dataset de teste: {len(test_dataset)}")
+# =============================================================================
+# SEÇÃO 5: CONFIGURAÇÃO E EXECUÇÃO DO TREINAMENTO
+# =============================================================================
 
-# --- 3. Instanciação e Customização da Arquitetura TTM com QLoRA ---
+# Hiperparâmetros de treinamento
+LEARNING_RATE = 5e-4                # Taxa de aprendizado otimizada para fine-tuning
+NUM_TRAIN_EPOCHS = 100              # Número máximo de épocas (com early stopping)
+PER_DEVICE_TRAIN_BATCH_SIZE = 2     # Batch size para treinamento (limitado por memória)
+PER_DEVICE_EVAL_BATCH_SIZE = 4      # Batch size para validação (pode ser maior)
 
-# Definir a configuração customizada do modelo TinyTimeMixer
-# Embora a Seção 1.3/3.1 do plano estratégico mencione 'from_config' para iniciar do zero [9, 18],
-# a aplicação de QLoRA (Seção 3.2) é tipicamente feita via 'from_pretrained' que carrega a arquitetura
-# e aplica a quantização aos pesos (mesmo que sejam aleatórios ou descartados para fine-tuning completo).
-# A forma mais prática de usar QLoRA com a arquitetura Granite TTM é via 'from_pretrained'
-# com uma 'config' customizada.
+def create_training_arguments():
+    """
+    Cria argumentos de treinamento otimizados para o modelo TTM.
+    
+    Configura estratégias de salvamento, avaliação e logging
+    para garantir o melhor modelo seja preservado.
+    
+    Returns:
+        TrainingArguments: Configuração de treinamento
+    """
+    return TrainingArguments(
+        output_dir="./results_ttm_model",              # Diretório de saída
+        overwrite_output_dir=True,                     # Sobrescrever resultados anteriores
+        learning_rate=LEARNING_RATE,                   # Taxa de aprendizado
+        num_train_epochs=NUM_TRAIN_EPOCHS,             # Número de épocas
+        do_eval=True,                                  # Executar avaliação
+        eval_strategy="epoch",                         # Avaliar a cada época
+        per_device_train_batch_size=PER_DEVICE_TRAIN_BATCH_SIZE,  # Batch size treino
+        per_device_eval_batch_size=PER_DEVICE_EVAL_BATCH_SIZE,    # Batch size validação
+        dataloader_num_workers=0,                      # Workers para carregamento (evita problemas)
+        report_to="none",                              # Não reportar para ferramentas externas
+        save_strategy="epoch",                         # Salvar modelo a cada época
+        logging_strategy="epoch",                      # Log de métricas a cada época
+        save_total_limit=2,                           # Manter apenas 2 checkpoints
+        logging_dir="./results_ttm_model/logs",       # Diretório de logs
+        load_best_model_at_end=True,                  # Carregar melhor modelo ao final
+        metric_for_best_model="eval_loss",            # Métrica para seleção do melhor modelo
+        greater_is_better=False,                      # Menor loss é melhor
+        use_cpu=DEVICE == "cpu",                      # Forçar CPU se necessário
+    )
 
-model_config = TinyTimeMixerConfig(
-    context_length=CONTEXT_LENGTH,
-    prediction_length=PREDICTION_LENGTH,
-    num_input_channels=trained_tsp.num_input_channels, # Total de canais (vendas, faturamento, uf_cat codificada)
-    prediction_channel_indices=trained_tsp.prediction_channel_indices, # Índices dos alvos ('vendas', 'faturamento')
-    exogenous_channel_indices=trained_tsp.exogenous_channel_indices, # Índices dos canais exógenos (se houver, vazio aqui)
-    decoder_mode="mix_channel", # Habilita o modelo a capturar correlações entre diferentes canais (produtos) [19, 20]
-    categorical_vocab_size_list=trained_tsp.categorical_vocab_size_list, # Tamanho do vocabulário para 'uf_cat' [19, 21]
-    # Outros parâmetros da arquitetura TTM podem ser ajustados aqui se necessário
-)
+def create_training_callbacks():
+    """
+    Cria callbacks para controle avançado do treinamento.
+    
+    Inclui early stopping para evitar overfitting e tracking
+    personalizado de métricas durante o treinamento.
+    
+    Returns:
+        list: Lista de callbacks configurados
+    """
+    # Early stopping: para quando não há melhoria por 15 épocas
+    early_stopping_callback = EarlyStoppingCallback(
+        early_stopping_patience=15,     # Paciência: 15 épocas sem melhoria
+        early_stopping_threshold=0.0,   # Threshold mínimo para considerar melhoria
+    )
+    
+    # Callback para tracking personalizado de métricas
+    tracking_callback = TrackingCallback()
+    
+    return [early_stopping_callback, tracking_callback]
 
-# Configuração da quantização (QLoRA) para otimizar o uso de memória [13]
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True, # Carrega o modelo com seus pesos quantizados em 4 bits [22, 23]
-    bnb_4bit_quant_type="nf4", # Tipo de quantização "NormalFloat 4" [22]
-    bnb_4bit_compute_dtype=torch.bfloat16, # Tipo de dado para cálculos internos, para manter estabilidade [22]
-)
+def create_optimizer_and_scheduler(model, train_dataset_size):
+    """
+    Cria otimizador e scheduler de learning rate otimizados.
+    
+    Utiliza AdamW com OneCycleLR para convergência rápida e estável.
+    
+    Args:
+        model: Modelo para otimização
+        train_dataset_size (int): Tamanho do dataset de treino
+    
+    Returns:
+        tuple: (optimizer, scheduler)
+    """
+    # Otimizador AdamW (versão melhorada do Adam)
+    optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
+    
+    # Scheduler OneCycleLR para variação cíclica do learning rate
+    steps_per_epoch = math.ceil(train_dataset_size / PER_DEVICE_TRAIN_BATCH_SIZE)
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=LEARNING_RATE,                # Learning rate máximo
+        epochs=NUM_TRAIN_EPOCHS,             # Total de épocas
+        steps_per_epoch=steps_per_epoch,     # Steps por época
+    )
+    
+    print(f"Otimização configurada:")
+    print(f"  Otimizador: AdamW (lr={LEARNING_RATE})")
+    print(f"  Scheduler: OneCycleLR")
+    print(f"  Steps por época: {steps_per_epoch}")
+    
+    return optimizer, scheduler
 
-# Carregamento da arquitetura do modelo com a configuração customizada e quantização
-# 'ignore_mismatched_sizes=True' é útil se a configuração customizada (e.g., num_input_channels, prediction_length)
-# difere da pre-treinada, forçando a re-inicialização das camadas relevantes.
-model = TinyTimeMixerForPrediction.from_pretrained(
-    "ibm-granite/granite-timeseries-ttm-r2", # Caminho da arquitetura base TTM-R2
-    config=model_config, # Passa a configuração customizada
-    quantization_config=bnb_config, # Aplica a configuração de quantização
-    device_map="auto", # Mapeia automaticamente para GPU ou CPU
-    ignore_mismatched_sizes=True, # Permite carregar a arquitetura mesmo com diferenças de tamanho de camada
-)
+class TTMTrainer(Trainer):
+    """
+    Trainer customizado para o modelo TinyTimeMixer.
+    
+    Sobrescreve o método compute_loss para filtrar adequadamente
+    as entradas compatíveis com o modelo TTM.
+    """
+    
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        """
+        Calcula a função de perda personalizada para TTM.
+        
+        Filtra apenas as chaves de entrada válidas para o modelo TTM,
+        evitando erros de entrada incompatível.
+        
+        Args:
+            model: Modelo TTM
+            inputs (dict): Inputs do batch
+            return_outputs (bool): Se deve retornar outputs além da loss
+            num_items_in_batch: Número de itens no batch
+        
+        Returns:
+            torch.Tensor ou tuple: Loss (e outputs se solicitado)
+        """
+        # Chaves válidas aceitas pelo modelo TTM
+        valid_keys = [
+            'past_values',              # Valores históricos
+            'future_values',            # Valores futuros (targets)
+            'past_observed_mask',       # Máscara de valores observados no passado
+            'future_observed_mask',     # Máscara de valores observados no futuro
+            'freq_token',               # Token de frequência temporal
+            'static_categorical_values' # Valores categóricos estáticos
+        ]
+        
+        # Filtrar apenas entradas válidas
+        filtered_inputs = {k: v for k, v in inputs.items() if k in valid_keys}
+        
+        # Forward pass no modelo
+        outputs = model(**filtered_inputs)
+        
+        # Extrair loss dos outputs
+        loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
+        
+        return (loss, outputs) if return_outputs else loss
 
-# Configuração do LoRA para PEFT (Parameter-Efficient Fine-Tuning)
-# O TTM é baseado em MLP-Mixer, que não usa "q_proj", "v_proj" como Transformers tradicionais.
-# É crucial identificar as camadas lineares corretas dentro da arquitetura TTM para aplicar o LoRA.
-# Nomes comuns para camadas lineares em MLPs podem ser 'mlp.fc1', 'mlp.fc2', 'linear', 'c_fc1', etc.
-# Para este exemplo, usaremos 'c_fc1' e 'c_fc2' como um palpite educado de nomes de camadas lineares internas.
-# **Importante**: Estes 'target_modules' podem precisar ser verificados na implementação exata do
-# 'TinyTimeMixerForPrediction' para garantir que o LoRA seja aplicado às camadas corretas.
-lora_config = LoraConfig(
-    r=16, # O "rank" da decomposição, um valor baixo para eficiência [24]
-    lora_alpha=32, # Fator de escala para os pesos adaptados [24]
-    target_modules=["c_fc1", "c_fc2"], # **Pode precisar de ajuste**: nomes de camadas lineares no TTM [12]
-    lora_dropout=0.1,
-    bias="none",
-    task_type="FEATURE_EXTRACTION", # Tipo de tarefa para PEFT. 'FEATURE_EXTRACTION' é um palpite genérico para TS.
-)
+def train_ttm_model():
+    """
+    Executa o treinamento completo do modelo TTM.
+    
+    Configura todos os componentes necessários e executa o treinamento
+    com monitoramento e salvamento automático do melhor modelo.
+    
+    Returns:
+        Trainer: Trainer após conclusão do treinamento
+    """
+    print("\n" + "="*80)
+    print("INICIANDO TREINAMENTO DO MODELO TTM")
+    print("="*80)
+    
+    # Criar componentes de treinamento
+    training_args = create_training_arguments()
+    callbacks = create_training_callbacks()
+    optimizer, scheduler = create_optimizer_and_scheduler(model, len(train_dataset))
+    
+    # Inicializar trainer customizado
+    trainer = TTMTrainer(
+        model=model,                        # Modelo TTM configurado
+        args=training_args,                 # Argumentos de treinamento
+        train_dataset=train_dataset,        # Dataset de treino
+        eval_dataset=valid_dataset,         # Dataset de validação
+        callbacks=callbacks,                # Callbacks (early stopping, tracking)
+        optimizers=(optimizer, scheduler),  # Otimizador e scheduler
+    )
+    
+    print(f"Trainer configurado:")
+    print(f"  Epochs máximas: {NUM_TRAIN_EPOCHS}")
+    print(f"  Batch size treino: {PER_DEVICE_TRAIN_BATCH_SIZE}")
+    print(f"  Batch size validação: {PER_DEVICE_EVAL_BATCH_SIZE}")
+    print(f"  Early stopping: 15 épocas de paciência")
+    print(f"  Dispositivo: {DEVICE}")
+    
+    print("\nIniciando treinamento...")
+    
+    # Executar treinamento
+    trainer.train()
+    
+    print("\n" + "="*80)
+    print("TREINAMENTO CONCLUÍDO")
+    print("="*80)
+    
+    return trainer
 
-# Aplica a configuração LoRA ao modelo
-model = get_peft_model(model, lora_config)
-print("\nModelo configurado para PEFT (LoRA):")
-model.print_trainable_parameters() # Mostra quantos parâmetros serão treinados (apenas os do LoRA)
+def save_final_model(trainer, save_path="./final_ttm_model"):
+    """
+    Salva o modelo final treinado.
+    
+    Args:
+        trainer: Trainer após treinamento
+        save_path (str): Caminho para salvar o modelo
+    """
+    print(f"\nSalvando modelo final em: {save_path}")
+    trainer.save_model(save_path)
+    
+    # Salvar também informações do preprocessador
+    import pickle
+    preprocessor_path = f"{save_path}/preprocessor.pkl"
+    with open(preprocessor_path, 'wb') as f:
+        pickle.dump(trained_tsp, f)
+    
+    print(f"Modelo salvo com sucesso!")
+    print(f"  Modelo: {save_path}")
+    print(f"  Preprocessador: {preprocessor_path}")
 
-# --- 4. Configuração e Execução do Treinamento ---
+# =============================================================================
+# EXECUÇÃO DO TREINAMENTO
+# =============================================================================
 
-# Configuração dos argumentos de treinamento usando 'TrainingArguments'
-# Ajustar 'per_device_train_batch_size' e 'learning_rate' é crucial para o desempenho e para evitar OOM.
-LEARNING_RATE = 5e-4 # Taxa de aprendizado inicial, um bom ponto de partida [25]
-NUM_TRAIN_EPOCHS = 100 # Número máximo de épocas. Early stopping pode parar antes [26]
-PER_DEVICE_TRAIN_BATCH_SIZE = 8 # Ajustar de acordo com a RAM/VRAM disponível. Comece pequeno e aumente.
-PER_DEVICE_EVAL_BATCH_SIZE = PER_DEVICE_TRAIN_BATCH_SIZE * 2 # Lotes de avaliação podem ser maiores
-
-training_args = TrainingArguments(
-    output_dir="./results_ttm_finetuned", # Diretório para salvar checkpoints e logs
-    overwrite_output_dir=True,
-    learning_rate=LEARNING_RATE,
-    num_train_epochs=NUM_TRAIN_EPOCHS,
-    do_eval=True, # Realizar avaliação durante o treinamento
-    evaluation_strategy="epoch", # Avaliar no dataset de validação a cada época [25]
-    per_device_train_batch_size=PER_DEVICE_TRAIN_BATCH_SIZE,
-    per_device_eval_batch_size=PER_DEVICE_EVAL_BATCH_SIZE,
-    dataloader_num_workers=os.cpu_count() // 2 if os.cpu_count() else 0, # Otimiza o carregamento de dados
-    report_to="none", # Desabilita o reporte para plataformas como Weights & Biases
-    save_strategy="epoch", # Salva um checkpoint do modelo a cada época [25]
-    logging_strategy="epoch", # Registra logs a cada época
-    save_total_limit=1, # Mantém apenas o melhor checkpoint (com menor 'eval_loss')
-    logging_dir="./results_ttm_finetuned/logs",
-    load_best_model_at_end=True, # Recarrega o melhor modelo (baseado em eval_loss) ao final [27]
-    metric_for_best_model="eval_loss", # Métrica para determinar o "melhor" modelo [27]
-    greater_is_better=False, # Para 'loss', um valor menor é melhor
-    use_cpu=DEVICE == "cpu", # Força o uso da CPU se não houver GPU disponível
-)
-
-# Callbacks para o treinamento eficiente
-early_stopping_callback = EarlyStoppingCallback(
-    early_stopping_patience=10, # Parar o treinamento se 'eval_loss' não melhorar por 10 épocas [28, 29]
-    early_stopping_threshold=0.0, # Um limiar mínimo para considerar uma melhoria [28, 29]
-)
-tracking_callback = TrackingCallback() # Um callback da TSFM para monitoramento de tempo/estatísticas [30, 31]
-
-# Otimizador e scheduler de learning rate
-# AdamW é um otimizador popular para deep learning. OneCycleLR ajusta a taxa de aprendizado dinamicamente.
-optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
-scheduler = OneCycleLR(
-    optimizer,
-    LEARNING_RATE,
-    epochs=NUM_TRAIN_EPOCHS,
-    steps_per_epoch=math.ceil(len(train_dataset) / PER_DEVICE_TRAIN_BATCH_SIZE),
-)
-
-# Instanciando o Trainer da Hugging Face
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=valid_dataset,
-    callbacks=[early_stopping_callback, tracking_callback],
-    optimizers=(optimizer, scheduler), # Passa o otimizador e o scheduler customizados
-)
-
-print("\nIniciando o treinamento do modelo...")
-trainer.train()
-print("Treinamento concluído.")
-
-# Salvar o modelo fine-tuned
-# Com PEFT, o 'trainer.save_model' salva os adaptadores LoRA. Para inferência, você pode carregar
-# o modelo base e então os adaptadores, ou mesclá-los em um único modelo (se a biblioteca PEFT suportar para TTM).
-trainer.save_model("./final_ttm_model_with_lora")
-
-# Exemplo de como mesclar os adaptadores com o modelo base e salvar (se aplicável e suportado para TTM)
-# Note: Esta parte pode variar e exigir testes ou consulta à documentação específica da PEFT/TSFM
-# para TinyTimeMixer, pois 'merge_and_unload' é mais comum em modelos de linguagem.
-# try:
-#     # Carrega o modelo base original (não quantizado ou LoRA)
-#     base_model = TinyTimeMixerForPrediction.from_pretrained(
-#         "ibm-granite/granite-timeseries-ttm-r2",
-#         config=model_config,
-#         device_map="auto"
-#     )
-#     # Carrega os adaptadores LoRA
-#     model_with_lora = PeftModel.from_pretrained(base_model, "./final_ttm_model_with_lora")
-#     # Mescla os adaptadores
-#     merged_model = model_with_lora.merge_and_unload()
-#     merged_model.save_pretrained("./final_ttm_model_merged")
-#     print(f"Modelo mesclado salvo em: ./final_ttm_model_merged")
-# except Exception as e:
-#     print(f"Não foi possível mesclar o modelo LoRA: {e}. O modelo LoRA foi salvo separadamente.")
-
-print(f"Modelo (com adaptadores LoRA) salvo em: {training_args.output_dir}")
+if __name__ == "__main__":
+    # Executar treinamento
+    trainer = train_ttm_model()
+    
+    # Salvar modelo final
+    save_final_model(trainer)
+    
+    print("\n🎉 Pipeline de treinamento TTM finalizado com sucesso!")
