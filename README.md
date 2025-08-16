@@ -54,7 +54,7 @@ Desenvolver um sistema de previsão capaz de:
 
 1. **Clone o repositório:**
 ```bash
-git clone <url-do-repositorio>
+git clone url-do-repositorio>](https://github.com/renatobarrosai/ttm-r2.1-challenge.git
 cd treinamento_semana
 ```
 
@@ -241,7 +241,7 @@ Este projeto está sob a licença MIT. Veja o arquivo `LICENSE` para mais detalh
 
 ## 👥 Autores
 
-- **Seu Nome** - *Desenvolvimento inicial* - [Seu GitHub](https://github.com/seuusername)
+- **Renato Barros** - *Desenvolvimento inicial* - [renatobarrosai](https://github.com/seuusername](https://github.com/renatobarrosai/)
 
 ## 🙏 Agradecimentos
 
